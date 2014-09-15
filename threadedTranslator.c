@@ -4,13 +4,13 @@
 #include <string.h>
 #include <pthread.h>
 
-pthread_cond_t read_cv;
-pthread_cond_t write_cv;
-
 char rbuf[10][1024];
 char wbuf[10][1024];
 pthread_mutex_t rmutex[10];
 pthread_mutex_t wmutex[10];
+
+pthread_cond_t rcond;
+pthread_cond_t wcond;
 
 int readingDone = 0;
 int translatingDone = 0;
@@ -20,15 +20,20 @@ void *tRead(void *inFile){
 	gzFile *in = inFile;
 	int bufIndx = 0;
 	int bytes_read, i;
+
 	for(;!gzeof(*in);){
 		pthread_mutex_lock(&rmutex[bufIndx]);
+		if(rbuf[bufIndx][0] != '\0')
+			pthread_cond_wait(&rcond, &rmutex[bufIndx]);
 		bytes_read = gzread(*in, rbuf[bufIndx], sizeof(rbuf[bufIndx]) - 1);
 		rbuf[bufIndx][bytes_read] = '\0';
+		pthread_cond_signal(&rcond);
 		pthread_mutex_unlock(&rmutex[bufIndx]);
-		//printf("%s", rbuf[bufIndx]); //prints the contents of buffer
-		
+	
 		bufIndx = (bufIndx + 1) % 10;
+		
 	}
+
 	readingDone = 1;
 }
 
@@ -38,15 +43,19 @@ void *tTranslate(void *param){
 	while(1){
 		pthread_mutex_lock(&rmutex[bufIndx]);
 
-		if(readingDone && rbuf[bufIndx][0] == '\0') {
-			translatingDone = 1;		
-			return(0);
+		if(rbuf[bufIndx][0] == '\0'){
+			if(readingDone){
+				translatingDone = 1;		
+				return(0);
+			}
+			pthread_cond_wait(&rcond, &rmutex[bufIndx]);
 		}
-
 		pthread_mutex_lock(&wmutex[bufIndx]);
+		if(wbuf[bufIndx][0] != '\0')
+			pthread_cond_wait(&wcond, &wmutex[bufIndx]);
 
 		strcpy(wbuf[bufIndx], rbuf[bufIndx]);
-		
+	
 		length = strlen(wbuf[bufIndx]);
 		for(i = 0; i < length; i++){
 			switch(wbuf[bufIndx][i]) {
@@ -67,16 +76,16 @@ void *tTranslate(void *param){
 					wbuf[bufIndx][i] = '5'; break;
 			}
 		}
-
+		
+		rbuf[bufIndx][0] = '\0';	
+	
+		pthread_cond_signal(&rcond);
+		pthread_cond_signal(&wcond);
+		pthread_mutex_unlock(&rmutex[bufIndx]);
 		pthread_mutex_unlock(&wmutex[bufIndx]);
 
-		//printf("%s", wbuf[bufIndx]); //prints the contents of buffer
-
-		rbuf[bufIndx][0] = '\0';
-
 		bufIndx = (bufIndx + 1) % 10;
-
-		pthread_mutex_unlock(&rmutex[bufIndx]);
+			
 
 	}	
 }
@@ -88,11 +97,18 @@ void *tWrite(void *outFile){
 		
 		pthread_mutex_lock(&wmutex[bufIndx]);
 
-		if(translatingDone && wbuf[bufIndx][0] == '\0')	return(0);
+		if(wbuf[bufIndx][0] == '\0'){
+			if(translatingDone){
+				writingDone = 1;
+				return(0);
+			}
+			pthread_cond_wait(&wcond, &wmutex[bufIndx]);
+		}
+		gzwrite(*out, wbuf[bufIndx], strlen(wbuf[bufIndx]));
 
-		gzwrite(*out, wbuf[bufIndx], strlen(wbuf[bufIndx]));	
-		printf("%s", wbuf[bufIndx]); //prints the contents of buffer
 		wbuf[bufIndx][0] = '\0'; //effectively empties the writing array
+
+		pthread_cond_signal(&wcond);
 		pthread_mutex_unlock(&wmutex[bufIndx]);
 
 		bufIndx = (bufIndx + 1) % 10;
@@ -128,10 +144,10 @@ int main(int argc, char **argv){
 		pthread_mutex_init(&rmutex[i], NULL);
 		pthread_mutex_init(&wmutex[i], NULL);
 	}
-	
-	pthread_cond_init(&read_cv, NULL);
-	pthread_cond_init(&write_cv, NULL);
 
+	pthread_cond_init(&rcond, NULL);
+	pthread_cond_init(&wcond, NULL);
+	
 	pthread_create(&readThread, NULL, tRead, &in);
 	pthread_create(&translateThread, NULL, tTranslate, NULL);
 	pthread_create(&writeThread, NULL, tWrite, &out);
@@ -142,6 +158,10 @@ int main(int argc, char **argv){
 
 	gzclose(in);
 	gzclose(out);
+
+	pthread_cond_destroy(&rcond);
+	pthread_cond_destroy(&wcond);
+	
 	
 		
 }
